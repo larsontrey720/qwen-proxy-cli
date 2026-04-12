@@ -319,11 +319,6 @@ chmod +x /usr/local/bin/cloudflared
 brew install cloudflared
 ```
 
-## Alternatives
-
-- [qwen-proxy](https://www.npmjs.com/package/qwen-proxy) - The underlying proxy package (installed automatically)
-- [qwen-code-oai-proxy](https://github.com/aptdnfapt/qwen-code-oai-proxy) - Similar concept, different implementation
-
 ## License
 
 MIT
