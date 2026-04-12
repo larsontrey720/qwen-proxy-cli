@@ -301,26 +301,28 @@ bun proxy.ts enable
 
 ### Retry Server
 
-The retry server sits in front of qwen-proxy and handles rate limiting gracefully:
+The retry server sits in front of qwen-proxy and intercepts requests, retrying 429s (rate limits) with fixed delay before passing through to upstream.
 
 **Flow:**
 ```
 cloudflared → :8081 (retry server) → :8080 (qwen-proxy) → Qwen API
 ```
 
-**Retry logic:**
+**Key retry logic:**
 ```typescript
 if (resp.status === 429 && retries < MAX_RETRIES) {
-  const delay = BASE_DELAY * Math.pow(2, retries); // 2s, 4s, 8s, 16s, 32s
-  await new Promise(r => setTimeout(r, delay * 1000));
+  await new Promise(r => setTimeout(r, RETRY_DELAY * 1000)); // fixed 2s
   return retryRequest(url, options, retries + 1);
 }
 ```
 
 **Configuration:**
 - Max retries: 5
-- Base delay: 2 seconds
-- Exponential backoff: 2s → 4s → 8s → 16s → 32s
+- Fixed delay: 2 seconds
+- Total max wait: 10 seconds
+- Connection: keep-alive for TCP reuse
+
+Both the retry server and qwen-proxy are started by `/usr/local/bin/qwen-proxy-startup.sh`.
 
 ---
 
