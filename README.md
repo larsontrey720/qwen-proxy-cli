@@ -273,6 +273,84 @@ bun proxy.ts disable
 
 Removes the service and startup script.
 
+### How Auto-Startup Works
+
+The startup script uses a clever process replacement pattern:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        Zo Service Manager                           │
+│                     (starts on boot, auto-restart)                  │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 │
+                                 ▼
+┌────────────────────────────────────────────────────────────────────┐
+│              /usr/local/bin/qwen-proxy-startup.sh                  │
+│                        (entrypoint)                                 │
+├────────────────────────────────────────────────────────────────────┤
+│  1. Fork cloudflared into background                               │
+│     ├─ cloudflared tunnel run &                                    │
+│     └─ PID stored in $CLOUDFLARED_PID                              │
+│                                                                     │
+│  2. Wait 3 seconds for tunnel to establish                         │
+│     └─ sleep 3                                                      │
+│                                                                     │
+│  3. Replace shell with qwen-proxy                                  │
+│     └─ exec qwen-proxy serve --headless                            │
+│                                                                     │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    ▼                         ▼
+        ┌───────────────────┐     ┌───────────────────┐
+        │   cloudflared     │     │   qwen-proxy      │
+        │   (background)    │     │   (foreground)    │
+        │                   │     │                   │
+        │  localhost:8080   │◄────│  serves API on    │
+        │       ▲           │     │  port 8080        │
+        │       │           │     │                   │
+        └───────┼───────────┘     └───────────────────┘
+                │
+                ▼
+        ┌───────────────────┐
+        │  Cloudflare       │
+        │  Edge Network     │
+        │                   │
+        │  qwen.domain.com  │
+        └───────────────────┘
+```
+
+**Why `exec`?**
+
+The `exec` command replaces the current shell process with qwen-proxy. This means:
+
+- The service manager sees qwen-proxy as the main process
+- If qwen-proxy crashes, the service manager detects it and restarts
+- Signals (SIGTERM, SIGINT) go directly to qwen-proxy for graceful shutdown
+- No orphaned shell processes
+
+**Process tree after startup:**
+
+```
+systemd/service-manager
+└── qwen-proxy serve --headless (PID: main)
+    └── cloudflared tunnel run (PID: child, background)
+```
+
+**On shutdown:**
+
+1. Service manager sends SIGTERM to qwen-proxy (main process)
+2. qwen-proxy handles graceful shutdown
+3. cloudflared continues running briefly, then exits when connection closes
+4. Service manager considers service stopped
+
+**On crash:**
+
+1. qwen-proxy crashes
+2. Service manager detects main process died
+3. Service manager restarts the entrypoint script
+4. Script starts fresh cloudflared + qwen-proxy
+
 ## Architecture
 
 ```
