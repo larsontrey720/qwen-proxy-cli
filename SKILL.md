@@ -153,6 +153,79 @@ cloudflared tunnel delete qwen-proxy
 cat /dev/shm/cloudflared-persistent.log
 ```
 
+## Auto-Startup (Persistent Tunnel)
+
+For 24/7 availability, enable auto-startup. This registers a Zo service that starts on boot and runs both cloudflared tunnel + qwen-proxy together.
+
+### Requirements
+
+1. Persistent Cloudflare tunnel (see section above)
+2. Zo service slot available (Free plan = 1 service)
+
+### Enable Auto-Startup
+
+```bash
+bun /home/workspace/Skills/qwen-proxy-setup/scripts/proxy.ts enable
+```
+
+This creates:
+- `/usr/local/bin/qwen-proxy-startup.sh` - Startup wrapper script
+- Instructions to register as Zo service
+
+### Register as Zo Service
+
+After running `enable`, register the service via UI:
+
+1. Go to [Hosting > Services](/?t=sites&s=services)
+2. Click "Add Service"
+3. Configure:
+   - **Label**: `qwen-proxy`
+   - **Protocol**: `http`
+   - **Port**: `8080`
+   - **Entrypoint**: `/usr/local/bin/qwen-proxy-startup.sh`
+
+Or via CLI:
+```bash
+zo service create qwen-proxy \
+  --entrypoint /usr/local/bin/qwen-proxy-startup.sh \
+  --protocol http \
+  --port 8080
+```
+
+### Disable Auto-Startup
+
+```bash
+bun /home/workspace/Skills/qwen-proxy-setup/scripts/proxy.ts disable
+```
+
+Removes the service and startup script.
+
+### How It Works
+
+The startup script at `/usr/local/bin/qwen-proxy-startup.sh`:
+
+```bash
+#!/bin/bash
+# Start cloudflared tunnel in background
+cloudflared --config /root/.cloudflared/config.yml tunnel run &
+CLOUDFLARED_PID=$!
+
+# Wait briefly for tunnel to establish
+sleep 3
+
+# Start qwen-proxy (replaces this process)
+exec qwen-proxy serve --headless
+```
+
+When the service starts:
+1. Forks cloudflared into background
+2. Waits 3 seconds for tunnel to establish
+3. Replaces itself with qwen-proxy via `exec`
+
+This ensures both processes are managed by the service supervisor.
+
+---
+
 ## Notes
 
 - Free tier: 1,000 requests per day

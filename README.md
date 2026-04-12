@@ -111,6 +111,8 @@ for chunk in stream:
 | `models` | List all available models |
 | `usage` | Show how many requests you've used today |
 | `tunnel` | Create a public Cloudflare tunnel (for remote access) |
+| `enable` | Enable auto-startup with persistent tunnel (requires Zo service) |
+| `disable` | Disable auto-startup service |
 
 ## Available Models
 
@@ -213,6 +215,63 @@ After setting up your persistent tunnel:
    - **Base URL**: `https://qwen.YOURDOMAIN.COM/v1`
    - **API Key**: `any` (not validated)
 3. Create a model mapping for `qwen3.6-plus`
+
+## Auto-Startup (Recommended for 24/7)
+
+For permanent availability, enable auto-startup. This creates a Zo service that starts on boot and runs both cloudflared tunnel + qwen-proxy together.
+
+### Requirements
+
+- Persistent Cloudflare tunnel (set up first, see above)
+- Zo service slot (Free plan = 1 service)
+
+### Enable
+
+```bash
+bun proxy.ts enable
+```
+
+This creates the startup script at `/usr/local/bin/qwen-proxy-startup.sh`:
+
+```bash
+#!/bin/bash
+# Start cloudflared tunnel in background
+cloudflared --config /root/.cloudflared/config.yml tunnel run &
+CLOUDFLARED_PID=$!
+
+# Wait briefly for tunnel to establish
+sleep 3
+
+# Start qwen-proxy (replaces this process)
+exec qwen-proxy serve --headless
+```
+
+### Register as Zo Service
+
+After running `enable`, register via UI or CLI:
+
+**Via UI:**
+1. Go to Hosting > Services
+2. Click "Add Service"
+3. Set entrypoint to: `/usr/local/bin/qwen-proxy-startup.sh`
+4. Set protocol to: `http`
+5. Set port to: `8080`
+
+**Via CLI:**
+```bash
+zo service create qwen-proxy \
+  --entrypoint /usr/local/bin/qwen-proxy-startup.sh \
+  --protocol http \
+  --port 8080
+```
+
+### Disable
+
+```bash
+bun proxy.ts disable
+```
+
+Removes the service and startup script.
 
 ## Architecture
 

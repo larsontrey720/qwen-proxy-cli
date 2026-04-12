@@ -12,6 +12,8 @@
  *   models  - List available models
  *   usage   - Show daily usage count
  *   tunnel  - Create a cloudflare tunnel for public access
+ *   enable  - Enable auto-startup with persistent tunnel (requires Zo service)
+ *   disable - Disable auto-startup service
  */
 
 const PROXY_PORT = 8080;
@@ -21,6 +23,9 @@ const QWEN_PROXY_LOG = "/dev/shm/qwen-proxy.log";
 const QWEN_DIR = `${process.env.HOME}/.qwen`;
 const ACCOUNT_ID = "myqwen";
 const LOG_FILE = "/dev/shm/qwen-proxy.log";
+const STARTUP_SCRIPT = "/usr/local/bin/qwen-proxy-startup.sh";
+const CLOUDFLARED_CONFIG = "/root/.cloudflared/config.yml";
+const CLOUDFLARED_DIR = "/root/.cloudflared";
 
 const COLORS = {
   green: "\x1b[32m",
@@ -291,6 +296,121 @@ async function tunnel() {
   }
 }
 
+async function enable() {
+  log("cyan", "=== Enable Auto-Startup ===\n");
+
+  // Check for existing persistent tunnel config
+  const { code: configCode } = await run(`ls ${CLOUDFLARED_CONFIG}`);
+  
+  if (configCode !== 0) {
+    log("red", "No persistent tunnel configuration found.\n");
+    log("cyan", "To set up a persistent tunnel, you need:");
+    console.log("  1. A Cloudflare account (free tier works)");
+    console.log("  2. A domain delegated to Cloudflare DNS");
+    console.log("\nThen run these commands:");
+    console.log("  cloudflared tunnel login");
+    console.log("  cloudflared tunnel create qwen-proxy");
+    console.log("  cloudflared tunnel route dns qwen-proxy qwen.yourdomain.com");
+    console.log("\nThen create the config at /root/.cloudflared/config.yml:");
+    console.log(`  tunnel: <tunnel-id-from-create-command>
+  credentials-file: /root/.cloudflared/<tunnel-id>.json
+  
+  ingress:
+    - hostname: qwen.yourdomain.com
+      service: http://localhost:8080
+    - service: http_status:404`);
+    process.exit(1);
+  }
+
+  // Read tunnel config to get hostname
+  const { stdout: configContent } = await run(`cat ${CLOUDFLARED_CONFIG}`);
+  const hostnameMatch = configContent.match(/hostname:\s*(\S+)/);
+  const hostname = hostnameMatch ? hostnameMatch[1] : "unknown";
+
+  // Check for tunnel credentials
+  const { stdout: credFiles } = await run(`ls ${CLOUDFLARED_DIR}/*.json 2>/dev/null`);
+  if (!credFiles.trim()) {
+    log("red", "No tunnel credentials found in /root/.cloudflared/");
+    process.exit(1);
+  }
+  log("green", `✓ Found tunnel credentials`);
+
+  // Create startup script
+  const startupScript = `#!/bin/bash
+# Qwen Proxy Startup Script
+# Starts cloudflared tunnel + qwen-proxy for persistent API access
+
+# Start cloudflared tunnel in background
+cloudflared --config ${CLOUDFLARED_CONFIG} tunnel run &
+
+CLOUDFLARED_PID=$!
+
+# Wait briefly for tunnel to establish
+sleep 3
+
+# Start qwen-proxy (replaces this process)
+exec qwen-proxy serve --headless
+`;
+
+  await run(`cat > ${STARTUP_SCRIPT} << 'EOFSCRIPT'
+${startupScript}EOFSCRIPT`);
+  await run(`chmod +x ${STARTUP_SCRIPT}`);
+  log("green", `✓ Created startup script: ${STARTUP_SCRIPT}`);
+
+  // Check if service already exists
+  const { stdout: services } = await run("zo service list 2>/dev/null || echo ''");
+  if (services.includes("qwen-proxy")) {
+    log("yellow", "Service 'qwen-proxy' already exists.");
+    log("cyan", "  To restart: zo service restart qwen-proxy");
+    return;
+  }
+
+  // Instructions for registering the service
+  log("cyan", "\nTo register as a Zo service (auto-starts on boot):");
+  console.log("\n  zo service create qwen-proxy \\");
+  console.log("    --entrypoint /usr/local/bin/qwen-proxy-startup.sh \\");
+  console.log("    --protocol http \\");
+  console.log("    --port 8080");
+  console.log("\nOr use the Zo Computer UI:");
+  console.log("  1. Go to Hosting > Services");
+  console.log("  2. Click 'Add Service'");
+  console.log("  3. Set entrypoint to: /usr/local/bin/qwen-proxy-startup.sh");
+  console.log("  4. Set protocol to: http");
+  console.log("  5. Set port to: 8080");
+
+  log("green", `\n✓ Setup complete! Public URL will be: https://${hostname}`);
+}
+
+async function disable() {
+  log("cyan", "=== Disable Auto-Startup ===\n");
+
+  // Check if service exists
+  const { stdout: services } = await run("zo service list 2>/dev/null || echo ''");
+  
+  if (services.includes("qwen-proxy")) {
+    log("yellow", "Removing 'qwen-proxy' service...");
+    const { code } = await run("zo service delete qwen-proxy 2>/dev/null");
+    if (code === 0) {
+      log("green", "✓ Service removed");
+    } else {
+      log("yellow", "Could not remove service automatically. Remove via Zo UI.");
+    }
+  } else {
+    log("yellow", "No 'qwen-proxy' service registered.");
+  }
+
+  // Remove startup script
+  const { code: rmCode } = await run(`rm -f ${STARTUP_SCRIPT}`);
+  if (rmCode === 0) {
+    log("green", "✓ Removed startup script");
+  }
+
+  // Stop any running processes
+  await run("pkill -f 'qwen-proxy serve' 2>/dev/null || true");
+  await run("pkill -f cloudflared 2>/dev/null || true");
+  log("green", "✓ Stopped running processes");
+}
+
 // CLI
 const [,, cmd] = process.argv;
 
@@ -322,6 +442,12 @@ switch (cmd) {
   case "tunnel":
     tunnel();
     break;
+  case "enable":
+    enable();
+    break;
+  case "disable":
+    disable();
+    break;
   default:
     console.log(`
 Qwen Proxy Management CLI
@@ -338,5 +464,7 @@ Commands:
   models   List available models
   usage    Show daily usage count
   tunnel   Create a cloudflare tunnel for public access
+  enable   Enable auto-startup with persistent tunnel (requires Zo service)
+  disable  Disable auto-startup service
 `);
 }
