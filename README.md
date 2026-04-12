@@ -372,19 +372,17 @@ systemd/service-manager
 The retry server sits in front of qwen-proxy on port 8081 and handles:
 
 **Retries on:**
-- `429` - Rate limited
-- `502/503/504` - Upstream errors (tunnel drops, qwen-proxy crashes)
-- Connection failures - Network errors, timeouts, ECONNREFUSED
+- `429` - Rate limited (up to 15 retries, 30s max wait)
+- `502/503/504` - Upstream errors (up to 5 retries, 10s max wait)
+- Connection failures - Network errors, timeouts, ECONNREFUSED (up to 5 retries)
 
 **Retry logic:**
 ```typescript
-// Fixed 2s delay, up to 5 retries
-RETRY_STATUSES = [429, 502, 503, 504];
+// Separate retry limits
+MAX_RETRIES_429 = 15;   // Rate limits get more patience
+MAX_RETRIES_5XX = 5;    // Connection issues fail faster
 
-// Also catches fetch() exceptions (network errors)
-catch (err) {
-  // Retry on connection failure
-}
+RETRY_STATUSES = [429, 502, 503, 504];
 ```
 
 **Architecture:**

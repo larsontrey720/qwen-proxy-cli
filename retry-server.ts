@@ -3,7 +3,8 @@
 
 const UPSTREAM = "http://localhost:8080";
 const PORT = 8081;
-const MAX_RETRIES = 5;
+const MAX_RETRIES_5XX = 5;      // For 502/503/504/connection errors
+const MAX_RETRIES_429 = 15;     // For rate limits
 const RETRY_DELAY = 2000; // 2s fixed delay
 
 // Status codes that trigger retry
@@ -19,10 +20,13 @@ async function retryRequest(
   try {
     resp = await fetch(url, options);
 
+    // Determine max retries based on error type
+    const maxRetries = resp.status === 429 ? MAX_RETRIES_429 : MAX_RETRIES_5XX;
+
     // Check if status code should trigger retry
-    if (RETRY_STATUSES.includes(resp.status) && retries < MAX_RETRIES) {
+    if (RETRY_STATUSES.includes(resp.status) && retries < maxRetries) {
       console.error(
-        `[retry] ${resp.status} from upstream, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${MAX_RETRIES})`
+        `[retry] ${resp.status} from upstream, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${maxRetries})`
       );
       await new Promise((r) => setTimeout(r, RETRY_DELAY));
       return retryRequest(url, options, retries + 1);
@@ -31,9 +35,9 @@ async function retryRequest(
     return resp;
   } catch (err: any) {
     // Connection failure (network error, timeout, ECONNREFUSED, etc.)
-    if (retries < MAX_RETRIES) {
+    if (retries < MAX_RETRIES_5XX) {
       console.error(
-        `[retry] Connection failed: ${err.message || err}, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${MAX_RETRIES})`
+        `[retry] Connection failed: ${err.message || err}, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${MAX_RETRIES_5XX})`
       );
       await new Promise((r) => setTimeout(r, RETRY_DELAY));
       return retryRequest(url, options, retries + 1);
@@ -79,4 +83,4 @@ Bun.serve({
 });
 
 console.log(`Retry proxy running on port ${PORT} -> ${UPSTREAM}`);
-console.log(`Retries: ${MAX_RETRIES}x with ${RETRY_DELAY}ms delay on 429/5xx/connection errors`);
+console.log(`Retries: 429 → ${MAX_RETRIES_429}x, 5xx/connection → ${MAX_RETRIES_5XX}x (${RETRY_DELAY}ms delay)`);

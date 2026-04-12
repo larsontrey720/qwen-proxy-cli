@@ -304,9 +304,9 @@ bun proxy.ts enable
 The retry server sits in front of qwen-proxy on port 8081 and handles:
 
 **Retries on:**
-- `429` - Rate limited
-- `502/503/504` - Upstream errors (tunnel drops, qwen-proxy crashes)
-- Connection failures - Network errors, timeouts, ECONNREFUSED
+- `429` - Rate limited (up to 15 retries)
+- `502/503/504` - Upstream errors (up to 5 retries)
+- Connection failures - Network errors, timeouts, ECONNREFUSED (up to 5 retries)
 
 **Retry logic:**
 ```typescript
@@ -356,5 +356,3 @@ Proxy not running. Run `start` command.
 Token expired. Run `setup` to refresh, or `restart` the proxy.
 
 ### "Tunnel not working"
-
-Quick tunnels can be unreliable. Use persistent tunnel instead.
