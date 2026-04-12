@@ -430,7 +430,7 @@ ${startupScript}EOFSCRIPT`);
   log("green", `\n✓ Setup complete! Public URL will be: https://${hostname}`);
   log("cyan", `\nRetry configuration:`);
   console.log(`  Max retries: 5`);
-  console.log(`  Base delay: 2s (exponential: 2s, 4s, 8s, 16s, 32s)`);
+  console.log(`  Delay: 2s (fixed)`);
 }
 
 async function disable() {
