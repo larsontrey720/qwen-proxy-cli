@@ -326,6 +326,34 @@ cloudflared → :8081 (retry server) → :8080 (qwen-proxy) → Qwen API
 
 When the tunnel drops and Cloudflare returns a 502 error page, the retry server catches it and keeps retrying until the tunnel recovers or qwen-proxy comes back online.
 
+### Response Caching
+
+The retry server also caches successful responses to avoid redundant API calls:
+
+```
+Request → Generate hash key from body → Check cache map
+                                         ↓
+                                   HIT? → Return cached response immediately
+                                         ↓ no
+                                   MISS? → Fetch from upstream qwen-proxy (with retry)
+                                         ↓
+                                   Cache response if OK (status 200)
+                                         ↓
+                                   Return to client
+```
+
+**Cache settings:**
+
+| Aspect | How it works |
+|--------|-------------|
+| **Cache key** | SHA-256 hash of the raw request body — identical prompts = same key |
+| **TTL** | 5 minutes per entry — after that, treated as fresh |
+| **Scope** | Only caches successful responses (status 200) |
+| **Eviction** | If > 100 entries, deletes oldest ones on next cache write |
+| **What's cached** | Full HTTP response — body + headers + status code |
+
+**Intended for:** Repeating the same system prompt or identical user messages hits cache instead of hitting Qwen's API again, avoiding 429s and saving tokens.
+
 ---
 
 ## Notes
