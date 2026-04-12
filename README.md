@@ -369,38 +369,30 @@ systemd/service-manager
 
 ### Retry Server
 
-The retry server sits in front of qwen-proxy and intercepts requests, retrying 429s (rate limits) with fixed delay before passing through to upstream.
+The retry server sits in front of qwen-proxy on port 8081 and handles:
 
-**Flow:**
+**Retries on:**
+- `429` - Rate limited
+- `502/503/504` - Upstream errors (tunnel drops, qwen-proxy crashes)
+- Connection failures - Network errors, timeouts, ECONNREFUSED
+
+**Retry logic:**
+```typescript
+// Fixed 2s delay, up to 5 retries
+RETRY_STATUSES = [429, 502, 503, 504];
+
+// Also catches fetch() exceptions (network errors)
+catch (err) {
+  // Retry on connection failure
+}
+```
+
+**Architecture:**
 ```
 cloudflared → :8081 (retry server) → :8080 (qwen-proxy) → Qwen API
 ```
 
-**Key retry logic:**
-```typescript
-if (resp.status === 429 && retries < MAX_RETRIES) {
-  await new Promise(r => setTimeout(r, RETRY_DELAY * 1000)); // fixed 2s
-  return retryRequest(url, options, retries + 1);
-}
-```
-
-**Configuration:**
-- Max retries: 5
-- Fixed delay: 2 seconds
-- Total max wait: 10 seconds
-- Connection: keep-alive for TCP reuse
-
-Both the retry server and qwen-proxy are started by `/usr/local/bin/qwen-proxy-startup.sh`.
-
----
-
-## How It Works
-
-1. **Credential Extraction**: Qwen Code stores OAuth tokens in `~/.qwen/oauth_creds.json.bak`. This CLI copies them to the format expected by `qwen-proxy`.
-
-2. **Token Refresh**: Access tokens expire after a few hours. The proxy automatically refreshes them using the refresh token.
-
-3. **OpenAI Compatibility**: The `qwen-proxy` npm package translates between OpenAI's API format and Qwen's internal API.
+When the tunnel drops and Cloudflare returns a 502 error page, the retry server catches it and keeps retrying until the tunnel recovers or qwen-proxy comes back online.
 
 ## Rate Limits
 
