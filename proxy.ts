@@ -246,34 +246,36 @@ async function tunnel() {
   // Check if tunnel already running
   const { stdout: pgrep } = await run("pgrep -f 'cloudflared tunnel'");
   if (pgrep.trim()) {
-    const logFile = Bun.file(CLOUDFLARED_LOG);
-    if (await logFile.exists()) {
-      const content = await logFile.text();
-      const match = content.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-      if (match) {
-        console.log(`${COLORS.green}Tunnel already running${COLORS.reset}`);
-        console.log(`\n  Public URL: ${COLORS.cyan}${match[0]}${COLORS.reset}`);
-        console.log(`  OpenAI Endpoint: ${COLORS.cyan}${match[0]}/v1${COLORS.reset}`);
-        console.log(`\n  Use in Zo BYOK:`);
-        console.log(`    Base URL: ${match[0]}/v1`);
-        console.log(`    API Key: any`);
-        console.log(`    Model: qwen3-coder-flash`);
-        return;
-      }
+    const { stdout: content } = await run(`cat ${CLOUDFLARED_LOG} 2>/dev/null`);
+    const match = content.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+    if (match) {
+      console.log(`${COLORS.green}Tunnel already running${COLORS.reset}`);
+      console.log(`\n  Public URL: ${COLORS.cyan}${match[0]}${COLORS.reset}`);
+      console.log(`  OpenAI Endpoint: ${COLORS.cyan}${match[0]}/v1${COLORS.reset}`);
+      console.log(`\n  Use in Zo BYOK:`);
+      console.log(`    Base URL: ${match[0]}/v1`);
+      console.log(`    API Key: any`);
+      console.log(`    Model: qwen3-coder-flash`);
+      return;
     }
   }
   
   // Start new tunnel
   await run("pkill -f 'cloudflared tunnel' 2>/dev/null || true");
+  await sleep(1);
+  await run(`rm -f ${CLOUDFLARED_LOG}`);
   await run(`nohup cloudflared tunnel --url http://localhost:${PROXY_PORT} > ${CLOUDFLARED_LOG} 2>&1 &`);
   
-  // Wait for tunnel to be ready
+  // Wait for tunnel to be ready - poll multiple times
   console.log("  Waiting for tunnel to initialize...");
-  await sleep(5);
   
-  const logFile = Bun.file(CLOUDFLARED_LOG);
-  const content = await logFile.text();
-  const match = content.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+  let match: RegExpMatchArray | null = null;
+  for (let i = 0; i < 15; i++) {
+    await sleep(2);
+    const { stdout: content } = await run(`cat ${CLOUDFLARED_LOG} 2>/dev/null`);
+    match = content.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+    if (match) break;
+  }
   
   if (match) {
     console.log(`${COLORS.green}✓ Tunnel created successfully!${COLORS.reset}`);
