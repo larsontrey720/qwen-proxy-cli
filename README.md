@@ -137,6 +137,83 @@ This creates a public URL like `https://xyz-abc.trycloudflare.com`. You can then
 
 **Note:** Cloudflare quick tunnel URLs are temporary and change each time you restart the tunnel.
 
+## Persistent Cloudflare Tunnel (Recommended)
+
+Quick tunnels randomly disconnect, even during active use. For a reliable, permanent URL, set up a persistent Cloudflare tunnel.
+
+### Requirements
+
+1. **Cloudflare account** (free tier works) - [Sign up here](https://dash.cloudflare.com/sign-up)
+2. **A domain on Cloudflare** - Either:
+   - Buy a domain through Cloudflare (~$10/year)
+   - Or delegate your existing domain's nameservers to Cloudflare
+
+### Setup Steps
+
+```bash
+# 1. Login to Cloudflare (opens browser for authorization)
+cloudflared tunnel login
+
+# 2. Create a named tunnel
+cloudflared tunnel create qwen-proxy
+# Output: Tunnel credentials written to /root/.cloudflared/<id>.json
+# Output: Created tunnel qwen-proxy with id <uuid>
+
+# 3. Route to a subdomain (replace YOURDOMAIN.COM with your domain)
+cloudflared tunnel route dns qwen-proxy qwen.YOURDOMAIN.COM
+# Output: Added CNAME qwen.YOURDOMAIN.COM which will route to this tunnel
+
+# 4. Run the tunnel (in foreground for testing)
+cloudflared tunnel run --url http://localhost:8080 qwen-proxy
+
+# 5. For background/production use:
+nohup cloudflared tunnel run --url http://localhost:8080 qwen-proxy > /dev/shm/cloudflared-persistent.log 2>&1 &
+```
+
+### Verify It Works
+
+```bash
+curl https://qwen.YOURDOMAIN.COM/health
+```
+
+You should see a JSON response with `"status": "ok"`.
+
+### Benefits Over Quick Tunnels
+
+| Feature | Quick Tunnel | Persistent Tunnel |
+|---------|-------------|-------------------|
+| URL stability | Random, changes | Permanent (`qwen.yourdomain.com`) |
+| Reliability | Can disconnect anytime | Stable 24/7 |
+| Idle timeout | ~4 hours | None |
+| Use case | Testing | Production |
+
+### Managing Your Tunnel
+
+```bash
+# List all tunnels
+cloudflared tunnel list
+
+# View tunnel info
+cloudflared tunnel info qwen-proxy
+
+# Delete tunnel (if needed)
+cloudflared tunnel delete qwen-proxy
+
+# View logs
+cat /dev/shm/cloudflared-persistent.log
+```
+
+### Example Config for Zo BYOK
+
+After setting up your persistent tunnel:
+
+1. Go to your AI provider settings
+2. Add custom provider:
+   - **Name**: Qwen Proxy
+   - **Base URL**: `https://qwen.YOURDOMAIN.COM/v1`
+   - **API Key**: `any` (not validated)
+3. Create a model mapping for `qwen3.6-plus`
+
 ## Architecture
 
 ```
