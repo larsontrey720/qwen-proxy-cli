@@ -286,17 +286,41 @@ bun proxy.ts enable
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │ --> │ Qwen Proxy  │ --> │  Qwen API   │
-│ (OpenAI SDK)│     │ (localhost) │     │ (portal.ai) │
-└─────────────┘     └─────────────┘     └─────────────┘
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Client    │ --> │ Retry Server │ --> │ Qwen Proxy  │ --> │  Qwen API   │
+│ (OpenAI SDK)│     │   (:8081)    │     │   (:8080)   │     │ (portal.ai) │
+└─────────────┘     └──────────────┘     └─────────────┘     └─────────────┘
                            │
-                           v (optional)
+                           │ retry 429s with exponential backoff
+                           v
                     ┌─────────────┐
                     │ Cloudflare  │
                     │   Tunnel    │
                     └─────────────┘
 ```
+
+### Retry Server
+
+The retry server sits in front of qwen-proxy and handles rate limiting gracefully:
+
+**Flow:**
+```
+cloudflared → :8081 (retry server) → :8080 (qwen-proxy) → Qwen API
+```
+
+**Retry logic:**
+```typescript
+if (resp.status === 429 && retries < MAX_RETRIES) {
+  const delay = BASE_DELAY * Math.pow(2, retries); // 2s, 4s, 8s, 16s, 32s
+  await new Promise(r => setTimeout(r, delay * 1000));
+  return retryRequest(url, options, retries + 1);
+}
+```
+
+**Configuration:**
+- Max retries: 5
+- Base delay: 2 seconds
+- Exponential backoff: 2s → 4s → 8s → 16s → 32s
 
 ---
 

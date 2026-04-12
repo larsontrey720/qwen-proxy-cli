@@ -354,24 +354,45 @@ systemd/service-manager
 ## Architecture
 
 ```
-┌─────────────────┐        ┌─────────────────┐        ┌─────────────────┐
-│  Your Client    │  HTTP  │  Qwen Proxy     │  OAuth │   Qwen API      │
-│  (OpenAI SDK)   │───────>│  (localhost)    │───────>│  (portal.qwen)  │
-└─────────────────┘        └─────────────────┘        └─────────────────┘
-                                    │
-                                    │ optional
-                                    v
-                           ┌─────────────────┐
-                           │ Cloudflare      │
-                           │ Tunnel (public) │
-                           └─────────────────┘
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Client    │ --> │ Retry Server │ --> │ Qwen Proxy  │ --> │  Qwen API   │
+│ (OpenAI SDK)│     │   (:8081)    │     │   (:8080)   │     │ (portal.ai) │
+└─────────────┘     └──────────────┘     └─────────────┘     └─────────────┘
+                           │
+                           │ retry 429s with exponential backoff
+                           v
+                    ┌─────────────┐
+                    │ Cloudflare  │
+                    │   Tunnel    │
+                    └─────────────┘
 ```
 
-The proxy:
-1. Accepts OpenAI-format requests on localhost:8080
-2. Converts them to Qwen's API format
-3. Authenticates using your Qwen Code OAuth token
-4. Returns OpenAI-format responses
+### Retry Server
+
+The retry server sits in front of qwen-proxy and intercepts requests, retrying 429s (rate limits) with exponential backoff before passing through to upstream.
+
+**Flow:**
+```
+cloudflared → :8081 (retry server) → :8080 (qwen-proxy) → Qwen API
+```
+
+**Retry logic:**
+```typescript
+if (resp.status === 429 && retries < MAX_RETRIES) {
+  const delay = BASE_DELAY * Math.pow(2, retries); // 2s, 4s, 8s, 16s, 32s
+  await new Promise(r => setTimeout(r, delay * 1000));
+  return retryRequest(url, options, retries + 1);
+}
+```
+
+**Configuration:**
+- Max retries: 5
+- Base delay: 2 seconds
+- Exponential backoff: 2s → 4s → 8s → 16s → 32s
+
+Both the retry server and qwen-proxy are started by `/usr/local/bin/qwen-proxy-startup.sh`.
+
+---
 
 ## How It Works
 

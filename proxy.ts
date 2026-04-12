@@ -317,7 +317,7 @@ async function enable() {
   
   ingress:
     - hostname: qwen.yourdomain.com
-      service: http://localhost:8080
+      service: http://localhost:8081
     - service: http_status:404`);
     process.exit(1);
   }
@@ -335,21 +335,63 @@ async function enable() {
   }
   log("green", `✓ Found tunnel credentials`);
 
-  // Create startup script
+  // Check for retry server script
+  const scriptDir = "/home/workspace/Skills/qwen-proxy-setup/scripts";
+  const retryScript = `${scriptDir}/retry-server.ts`;
+  const { code: retryCode } = await run(`ls ${retryScript}`);
+  
+  if (retryCode !== 0) {
+    log("red", "Retry server script not found. Run from skill directory.");
+    process.exit(1);
+  }
+  log("green", `✓ Found retry server script`);
+
+  // Update cloudflared config to point to retry server (8081)
+  const updatedConfig = configContent.replace(/service: http:\/\/localhost:8080/g, "service: http://localhost:8081");
+  await run(`cat > ${CLOUDFLARED_CONFIG} << 'EOFCONFIG'
+${updatedConfig}EOFCONFIG`);
+  log("green", `✓ Updated cloudflared config to use retry server (port 8081)`);
+
+  // Create startup script with retry server
   const startupScript = `#!/bin/bash
-# Qwen Proxy Startup Script
-# Starts cloudflared tunnel + qwen-proxy for persistent API access
+# Qwen Proxy Startup Script with Retry Server
+# Starts both retry server (8081) and qwen-proxy (8080)
+#
+# Flow: cloudflared → :8081 (retry) → :8080 (qwen-proxy) → Qwen API
 
-# Start cloudflared tunnel in background
-cloudflared --config ${CLOUDFLARED_CONFIG} tunnel run &
+set -e
 
-CLOUDFLARED_PID=$!
+# Paths
+SCRIPT_DIR="/home/workspace/Skills/qwen-proxy-setup/scripts"
+RETRY_SCRIPT="$SCRIPT_DIR/retry-server.ts"
+CLOUDFLARE_CONFIG="${CLOUDFLARED_CONFIG}"
+LOG_DIR="/dev/shm"
 
-# Wait briefly for tunnel to establish
-sleep 3
+# Start cloudflared (background)
+if [ -f "$CLOUDFLARE_CONFIG" ]; then
+    echo "Starting cloudflared tunnel..."
+    cloudflared --config "$CLOUDFLARE_CONFIG" tunnel run > "$LOG_DIR/cloudflared.log" 2>&1 &
+    CLOUDFLARED_PID=$!
+    sleep 3
+fi
 
-# Start qwen-proxy (replaces this process)
-exec qwen-proxy serve --headless
+# Start qwen-proxy (background)
+echo "Starting qwen-proxy on :8080..."
+qwen-proxy serve --headless > "$LOG_DIR/qwen-proxy.log" 2>&1 &
+QWEN_PID=$!
+
+# Wait for qwen-proxy to be ready
+for i in {1..10}; do
+    if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+        echo "qwen-proxy ready"
+        break
+    fi
+    sleep 1
+done
+
+# Start retry server (foreground - this becomes the main process)
+echo "Starting retry server on :8081..."
+exec bun "$RETRY_SCRIPT" 8081 8080
 `;
 
   await run(`cat > ${STARTUP_SCRIPT} << 'EOFSCRIPT'
@@ -370,15 +412,18 @@ ${startupScript}EOFSCRIPT`);
   console.log("\n  zo service create qwen-proxy \\");
   console.log("    --entrypoint /usr/local/bin/qwen-proxy-startup.sh \\");
   console.log("    --protocol http \\");
-  console.log("    --port 8080");
+  console.log("    --port 8081");
   console.log("\nOr use the Zo Computer UI:");
   console.log("  1. Go to Hosting > Services");
   console.log("  2. Click 'Add Service'");
   console.log("  3. Set entrypoint to: /usr/local/bin/qwen-proxy-startup.sh");
   console.log("  4. Set protocol to: http");
-  console.log("  5. Set port to: 8080");
+  console.log("  5. Set port to: 8081");
 
   log("green", `\n✓ Setup complete! Public URL will be: https://${hostname}`);
+  log("cyan", `\nRetry configuration:`);
+  console.log(`  Max retries: 5`);
+  console.log(`  Base delay: 2s (exponential: 2s, 4s, 8s, 16s, 32s)`);
 }
 
 async function disable() {
