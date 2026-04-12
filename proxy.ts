@@ -314,6 +314,7 @@ async function enable() {
     console.log("\nThen create the config at /root/.cloudflared/config.yml:");
     console.log(`  tunnel: <tunnel-id-from-create-command>
   credentials-file: /root/.cloudflared/<tunnel-id>.json
+  no-autocreate: true
   
   ingress:
     - hostname: qwen.yourdomain.com
@@ -347,10 +348,16 @@ async function enable() {
   log("green", `✓ Found retry server script`);
 
   // Update cloudflared config to point to retry server (8081)
-  const updatedConfig = configContent.replace(/service: http:\/\/localhost:8080/g, "service: http://localhost:8081");
+  const updatedConfig = configContent
+    .replace(/service: http:\/\/localhost:8080/g, "service: http://localhost:8081")
+    .replace(/no-autocreate: true/g, "")  // Remove if exists, we'll add it
+    .replace(/(credentials-file:.*)/, "$1\nno-autocreate: true");  // Add after credentials-file
+  
   await run(`cat > ${CLOUDFLARED_CONFIG} << 'EOFCONFIG'
-${updatedConfig}EOFCONFIG`);
+${updatedConfig}
+EOFCONFIG`);
   log("green", `✓ Updated cloudflared config to use retry server (port 8081)`);
+  log("green", `✓ Added no-autocreate: true for safety`);
 
   // Create startup script with retry server
   const startupScript = `#!/bin/bash
