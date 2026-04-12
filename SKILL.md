@@ -37,6 +37,8 @@ bun /home/workspace/Skills/qwen-proxy-setup/scripts/proxy.ts tunnel
 | `models` | List available models |
 | `usage` | Show daily usage count |
 | `tunnel` | Create a cloudflare tunnel for public access |
+| `enable` | Enable auto-startup with persistent tunnel |
+| `disable` | Disable auto-startup service |
 
 ## Available Models
 
@@ -88,6 +90,199 @@ print(response.choices[0].message.content)
    - **API Key**: `any`
 4. Create a model and use `qwen3-coder-flash`
 
+---
+
+## Persistent Cloudflare Tunnel (Recommended)
+
+Quick tunnels randomly disconnect. For a permanent URL, set up a persistent tunnel.
+
+### Requirements
+
+1. **Cloudflare account** (free tier works)
+2. **A domain on Cloudflare** - Buy one through Cloudflare or delegate nameservers
+
+### Setup
+
+```bash
+# 1. Login to Cloudflare
+cloudflared tunnel login
+
+# 2. Create a named tunnel
+cloudflared tunnel create qwen-proxy
+# Output: Tunnel credentials written to /root/.cloudflared/<id>.json
+
+# 3. Route to a subdomain
+cloudflared tunnel route dns qwen-proxy qwen.YOURDOMAIN.COM
+
+# 4. Create config file
+cat > /root/.cloudflared/config.yml << 'EOF'
+tunnel: <TUNNEL_ID>
+credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: qwen.YOURDOMAIN.COM
+    service: http://localhost:8080
+  - service: http_status:404
+EOF
+
+# 5. Run the tunnel
+cloudflared tunnel run qwen-proxy
+```
+
+### Benefits
+
+| Feature | Quick Tunnel | Persistent Tunnel |
+|---------|-------------|-------------------|
+| URL stability | Random, changes | Permanent |
+| Reliability | Can disconnect | Stable 24/7 |
+| Idle timeout | ~4 hours | None |
+
+---
+
+## Auto-Startup (24/7 Availability)
+
+For permanent availability, enable auto-startup. This creates a Zo service that starts on boot.
+
+### Requirements
+
+- Persistent Cloudflare tunnel (set up first)
+- Zo service slot (Free plan = 1 service)
+
+### Enable
+
+```bash
+bun /home/workspace/Skills/qwen-proxy-setup/scripts/proxy.ts enable
+```
+
+This creates `/usr/local/bin/qwen-proxy-startup.sh`:
+
+```bash
+#!/bin/bash
+cloudflared --config /root/.cloudflared/config.yml tunnel run &
+CLOUDFLARED_PID=$!
+sleep 3
+exec qwen-proxy serve --headless
+```
+
+### Register as Zo Service
+
+**Via UI:**
+1. Go to Hosting > Services
+2. Click "Add Service"
+3. Set entrypoint: `/usr/local/bin/qwen-proxy-startup.sh`
+4. Set protocol: `http`
+5. Set port: `8080`
+
+**Via CLI:**
+```bash
+zo service create qwen-proxy \
+  --entrypoint /usr/local/bin/qwen-proxy-startup.sh \
+  --protocol http \
+  --port 8080
+```
+
+### How Auto-Startup Works
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        Zo Service Manager                           │
+│                     (starts on boot, auto-restart)                  │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 │
+                                 ▼
+┌────────────────────────────────────────────────────────────────────┐
+│              /usr/local/bin/qwen-proxy-startup.sh                  │
+│                        (entrypoint)                                 │
+├────────────────────────────────────────────────────────────────────┤
+│  1. Fork cloudflared into background                               │
+│  2. Wait 3 seconds for tunnel to establish                         │
+│  3. Replace shell with qwen-proxy (exec)                           │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    ▼                         ▼
+        ┌───────────────────┐     ┌───────────────────┐
+        │   cloudflared     │     │   qwen-proxy      │
+        │   (background)    │     │   (foreground)    │
+        │                   │     │                   │
+        │  localhost:8080   │◄────│  serves API on    │
+        │       ▲           │     │  port 8080        │
+        │       │           │     │                   │
+        └───────┼───────────┘     └───────────────────┘
+                │
+                ▼
+        ┌───────────────────┐
+        │  Cloudflare Edge  │
+        │  qwen.domain.com  │
+        └───────────────────┘
+```
+
+**Why `exec`?**
+
+The `exec` command replaces the shell process with qwen-proxy:
+- Service manager sees qwen-proxy as the main process
+- If qwen-proxy crashes, service manager restarts it
+- Signals go directly to qwen-proxy for graceful shutdown
+
+### Disable
+
+```bash
+bun /home/workspace/Skills/qwen-proxy-setup/scripts/proxy.ts disable
+```
+
+---
+
+## Migrating to Another VM
+
+To move the tunnel to a new machine while keeping the same URL:
+
+**Step 1: Copy credentials from current VM**
+
+```bash
+# Cloudflare tunnel credentials
+cat /root/.cloudflared/<tunnel-id>.json
+
+# Qwen OAuth token
+cat /root/.qwen/oauth_creds_myqwen.json
+```
+
+**Step 2: On the new VM**
+
+```bash
+# Install dependencies
+npm install -g qwen-proxy
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+chmod +x /usr/local/bin/cloudflared
+
+# Create directories
+mkdir -p /root/.cloudflared /root/.qwen
+
+# Add tunnel credentials
+cat > /root/.cloudflared/<tunnel-id>.json << 'EOF'
+{...paste credentials here...}
+EOF
+
+# Add config
+cat > /root/.cloudflared/config.yml << 'EOF'
+tunnel: <tunnel-id>
+credentials-file: /root/.cloudflared/<tunnel-id>.json
+ingress:
+  - hostname: qwen.YOURDOMAIN.COM
+    service: http://localhost:8080
+  - service: http_status:404
+EOF
+
+# Add Qwen credentials
+cat > /root/.qwen/oauth_creds_myqwen.json << 'EOF'
+{...paste token here...}
+EOF
+
+# Enable auto-startup
+bun proxy.ts enable
+```
+
+---
+
 ## Architecture
 
 ```
@@ -103,127 +298,6 @@ print(response.choices[0].message.content)
                     └─────────────┘
 ```
 
-## Persistent Cloudflare Tunnel (Recommended)
-
-Quick tunnels randomly disconnect. For a permanent URL, set up a persistent tunnel.
-
-### Requirements
-
-1. **Cloudflare account** (free) - https://dash.cloudflare.com/sign-up
-2. **Domain on Cloudflare** - either buy one there (~$10/year) or delegate nameservers
-
-### Setup Steps
-
-```bash
-# 1. Login to Cloudflare (opens browser)
-cloudflared tunnel login
-
-# 2. Create a named tunnel
-cloudflared tunnel create qwen-proxy
-
-# 3. Route to a subdomain (replace YOURDOMAIN.COM)
-cloudflared tunnel route dns qwen-proxy qwen.YOURDOMAIN.COM
-
-# 4. Run in background
-nohup cloudflared tunnel run --url http://localhost:8080 qwen-proxy > /dev/shm/cloudflared-persistent.log 2>&1 &
-```
-
-### Verify
-
-```bash
-curl https://qwen.YOURDOMAIN.COM/health
-```
-
-### Benefits
-
-- Permanent URL (no random changes)
-- No idle timeout disconnects
-- Works 24/7
-
-### Manage Tunnel
-
-```bash
-# List tunnels
-cloudflared tunnel list
-
-# Delete tunnel
-cloudflared tunnel delete qwen-proxy
-
-# View logs
-cat /dev/shm/cloudflared-persistent.log
-```
-
-## Auto-Startup (Persistent Tunnel)
-
-For 24/7 availability, enable auto-startup. This registers a Zo service that starts on boot and runs both cloudflared tunnel + qwen-proxy together.
-
-### Requirements
-
-1. Persistent Cloudflare tunnel (see section above)
-2. Zo service slot available (Free plan = 1 service)
-
-### Enable Auto-Startup
-
-```bash
-bun /home/workspace/Skills/qwen-proxy-setup/scripts/proxy.ts enable
-```
-
-This creates:
-- `/usr/local/bin/qwen-proxy-startup.sh` - Startup wrapper script
-- Instructions to register as Zo service
-
-### Register as Zo Service
-
-After running `enable`, register the service via UI:
-
-1. Go to [Hosting > Services](/?t=sites&s=services)
-2. Click "Add Service"
-3. Configure:
-   - **Label**: `qwen-proxy`
-   - **Protocol**: `http`
-   - **Port**: `8080`
-   - **Entrypoint**: `/usr/local/bin/qwen-proxy-startup.sh`
-
-Or via CLI:
-```bash
-zo service create qwen-proxy \
-  --entrypoint /usr/local/bin/qwen-proxy-startup.sh \
-  --protocol http \
-  --port 8080
-```
-
-### Disable Auto-Startup
-
-```bash
-bun /home/workspace/Skills/qwen-proxy-setup/scripts/proxy.ts disable
-```
-
-Removes the service and startup script.
-
-### How It Works
-
-The startup script at `/usr/local/bin/qwen-proxy-startup.sh`:
-
-```bash
-#!/bin/bash
-# Start cloudflared tunnel in background
-cloudflared --config /root/.cloudflared/config.yml tunnel run &
-CLOUDFLARED_PID=$!
-
-# Wait briefly for tunnel to establish
-sleep 3
-
-# Start qwen-proxy (replaces this process)
-exec qwen-proxy serve --headless
-```
-
-When the service starts:
-1. Forks cloudflared into background
-2. Waits 3 seconds for tunnel to establish
-3. Replaces itself with qwen-proxy via `exec`
-
-This ensures both processes are managed by the service supervisor.
-
 ---
 
 ## Notes
@@ -233,6 +307,8 @@ This ensures both processes are managed by the service supervisor.
 - Tunnel URLs change on restart (cloudflare quick tunnels)
 - Avoid `coder-model` for simple requests - it's slow and can timeout
 - Use streaming (`"stream": true`) for long responses
+
+---
 
 ## Troubleshooting
 
@@ -250,3 +326,7 @@ Proxy not running. Run `start` command.
 ### "Unauthorized" / "Invalid token"
 
 Token expired. Run `setup` to refresh, or `restart` the proxy.
+
+### "Tunnel not working"
+
+Quick tunnels can be unreliable. Use persistent tunnel instead.
