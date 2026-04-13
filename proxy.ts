@@ -365,6 +365,9 @@ EOFCONFIG`);
 # Starts both retry server (8081) and qwen-proxy (8080)
 #
 # Flow: cloudflared → :8081 (retry) → :8080 (qwen-proxy) → Qwen API
+#
+# IMPORTANT: Zo service with local_port=8081 injects PORT=8081.
+# We explicitly override PORT=8080 for qwen-proxy to prevent port collision.
 
 set -e
 
@@ -383,8 +386,9 @@ if [ -f "$CLOUDFLARE_CONFIG" ]; then
 fi
 
 # Start qwen-proxy (background)
+# EXPLICITLY set PORT=8080 to override any Zo-injected PORT=8081
 echo "Starting qwen-proxy on :8080..."
-qwen-proxy serve --headless > "$LOG_DIR/qwen-proxy.log" 2>&1 &
+PORT=8080 qwen-proxy serve --headless > "$LOG_DIR/qwen-proxy.log" 2>&1 &
 QWEN_PID=$!
 
 # Wait for qwen-proxy to be ready
@@ -397,8 +401,9 @@ for i in {1..10}; do
 done
 
 # Start retry server (foreground - this becomes the main process)
+# Retry server binds to :8081, proxies to :8080
 echo "Starting retry server on :8081..."
-exec bun "$RETRY_SCRIPT" 8081 8080
+exec bun "$RETRY_SCRIPT"
 `;
 
   await run(`cat > ${STARTUP_SCRIPT} << 'EOFSCRIPT'

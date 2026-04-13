@@ -1,9 +1,12 @@
 #!/usr/bin/env bun
 // Lightweight proxy that retries on 429, 5xx errors, and connection failures
-// Also caches successful responses to avoid redundant API calls
+//
+// IMPORTANT: This server binds to :8081 (hardcoded).
+// We intentionally DO NOT read PORT from env to avoid collision with qwen-proxy.
+// Zo service with local_port=8081 injects PORT=8081, but we want to stay explicit.
 
 const UPSTREAM = "http://localhost:8080";
-const PORT = 8081;
+const PORT = 8081;  // Hardcoded - do not use process.env.PORT
 const RETRY_DELAY = 2000; // 2s fixed delay
 const MAX_RETRIES_429 = 15; // More patience for rate limits
 const MAX_RETRIES_5XX = 5; // Less patience for server errors

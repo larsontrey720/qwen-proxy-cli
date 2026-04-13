@@ -166,20 +166,33 @@ exec qwen-proxy serve --headless
 
 ### Register as Zo Service
 
+After running `enable`, register via UI or CLI:
+
 **Via UI:**
 1. Go to Hosting > Services
 2. Click "Add Service"
-3. Set entrypoint: `/usr/local/bin/qwen-proxy-startup.sh`
-4. Set protocol: `http`
-5. Set port: `8080`
+3. Set entrypoint to: `/usr/local/bin/qwen-proxy-startup.sh`
+4. Set protocol to: `http`
+5. Set port to: `8081`
 
 **Via CLI:**
 ```bash
 zo service create qwen-proxy \
   --entrypoint /usr/local/bin/qwen-proxy-startup.sh \
   --protocol http \
-  --port 8080
+  --port 8081
 ```
+
+**Port collision prevention:**
+
+When you register a Zo service with `local_port=8081`, the service manager injects `PORT=8081` into the environment. This could cause qwen-proxy to bind to 8081 instead of 8080, colliding with the retry server.
+
+The startup script prevents this by explicitly setting:
+```bash
+PORT=8080 qwen-proxy serve --headless
+```
+
+This overrides any injected `PORT` value, ensuring qwen-proxy always binds to 8080.
 
 ### How Auto-Startup Works
 
