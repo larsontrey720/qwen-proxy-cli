@@ -7,14 +7,17 @@
 
 const UPSTREAM = "http://localhost:8080";
 const PORT = 8081;  // Hardcoded - do not use process.env.PORT
+const DEBUG_PORT = 8082;  // Cache stats endpoint
 const RETRY_DELAY = 2000; // 2s fixed delay
-const MAX_RETRIES_429 = 15; // More patience for rate limits
-const MAX_RETRIES_5XX = 5; // Less patience for server errors
+const MAX_RETRIES_429 = 60; // Extended patience for rate limits (2min max)
+const MAX_RETRIES_5XX = 60; // Extended patience for server errors
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const MAX_CACHE_SIZE = 100;
+const CACHE_FILE = "/dev/shm/qwen-cache.json";
+const LOG_FILE = "/dev/shm/retry-server.log";
 
 // Status codes that trigger retry
-const RETRY_STATUSES = [429, 502, 503, 504];
+const RETRY_STATUSES = [429, 502, 503, 504, 530]; // 530 = tunnel unregistered
 
 // Response cache: Map<hash, {response: CachedResponse, timestamp: number}>
 const responseCache = new Map<string, { response: CachedResponse; timestamp: number }>();
@@ -23,6 +26,61 @@ interface CachedResponse {
   status: number;
   headers: Record<string, string>;
   body: string;
+}
+
+interface CacheEntry {
+  response: CachedResponse;
+  timestamp: number;
+}
+
+interface CacheFile {
+  entries: [string, CacheEntry][];
+  savedAt: number;
+}
+
+// Log to file
+function log(msg: string) {
+  const timestamp = new Date().toISOString();
+  const line = `${timestamp} ${msg}\n`;
+  console.log(msg);
+  try {
+    Bun.file(LOG_FILE).append(line).catch(() => {});
+  } catch {}
+}
+
+// Load cache from file
+async function loadCache() {
+  try {
+    const file = Bun.file(CACHE_FILE);
+    if (await file.exists()) {
+      const data = await file.json() as CacheFile;
+      const now = Date.now();
+      
+      for (const [key, entry] of data.entries) {
+        // Skip expired entries
+        if (now - entry.timestamp < CACHE_TTL) {
+          responseCache.set(key, entry);
+        }
+      }
+      log(`[cache] Loaded ${responseCache.size} entries from file`);
+    }
+  } catch (err) {
+    log(`[cache] No existing cache file or load failed`);
+  }
+}
+
+// Save cache to file
+async function saveCache() {
+  try {
+    const entries = [...responseCache.entries()];
+    const data: CacheFile = {
+      entries,
+      savedAt: Date.now(),
+    };
+    await Bun.write(CACHE_FILE, JSON.stringify(data));
+  } catch (err) {
+    log(`[cache] Failed to save: ${err}`);
+  }
 }
 
 // Simple hash function for request body
@@ -71,12 +129,13 @@ function checkCache(hash: string): CachedResponse | null {
 }
 
 // Store response in cache
-function cacheResponse(hash: string, response: CachedResponse) {
+async function cacheResponse(hash: string, response: CachedResponse) {
   cleanCache(); // Clean before adding
   responseCache.set(hash, {
     response,
     timestamp: Date.now(),
   });
+  await saveCache(); // Persist to file
 }
 
 async function retryRequest(
@@ -93,9 +152,7 @@ async function retryRequest(
     // Retry on specific status codes
     if (RETRY_STATUSES.includes(resp.status) && retries < maxRetries) {
       const isRateLimit = resp.status === 429;
-      console.error(
-        `[retry] ${resp.status} hit, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${maxRetries})`
-      );
+      log(`[retry] ${resp.status} hit, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${maxRetries})`);
       await new Promise((r) => setTimeout(r, RETRY_DELAY));
       return retryRequest(url, options, retries + 1, isRateLimit);
     }
@@ -104,9 +161,7 @@ async function retryRequest(
   } catch (err: any) {
     // Retry on connection errors
     if (retries < MAX_RETRIES_5XX) {
-      console.error(
-        `[retry] Connection failed: ${err.message || err}, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${MAX_RETRIES_5XX})`
-      );
+      log(`[retry] Connection failed: ${err.message || err}, waiting ${RETRY_DELAY}ms (attempt ${retries + 1}/${MAX_RETRIES_5XX})`);
       await new Promise((r) => setTimeout(r, RETRY_DELAY));
       return retryRequest(url, options, retries + 1, false);
     }
@@ -114,6 +169,7 @@ async function retryRequest(
   }
 }
 
+// Main proxy server
 Bun.serve({
   port: PORT,
   async fetch(req) {
@@ -124,17 +180,17 @@ Bun.serve({
     const body = req.body ? await req.text() : "";
     const cacheKey = await hashBody(body);
 
-    // Check cache for GET or POST with body
+    // Check cache for POST with body
     if (req.method === "POST" && body) {
       const cached = checkCache(cacheKey);
       if (cached) {
-        console.log(`[cache] HIT for ${cacheKey.slice(0, 8)}...`);
+        log(`[cache] HIT for ${cacheKey.slice(0, 8)}...`);
         return new Response(cached.body, {
           status: cached.status,
           headers: cached.headers,
         });
       }
-      console.log(`[cache] MISS for ${cacheKey.slice(0, 8)}...`);
+      log(`[cache] MISS for ${cacheKey.slice(0, 8)}...`);
     }
 
     const headers: Record<string, string> = {};
@@ -158,12 +214,12 @@ Bun.serve({
       const cachedHeaders: Record<string, string> = {};
       resp.headers.forEach((v, k) => cachedHeaders[k] = v);
       
-      cacheResponse(cacheKey, {
+      await cacheResponse(cacheKey, {
         status: resp.status,
         headers: cachedHeaders,
         body: respBody,
       });
-      console.log(`[cache] Stored ${cacheKey.slice(0, 8)}...`);
+      log(`[cache] Stored ${cacheKey.slice(0, 8)}...`);
       
       return new Response(respBody, {
         status: resp.status,
@@ -175,6 +231,50 @@ Bun.serve({
   },
 });
 
-console.log(`Retry proxy running on port ${PORT} -> ${UPSTREAM}`);
-console.log(`Retries: 429 → ${MAX_RETRIES_429}x, 5xx/connection → ${MAX_RETRIES_5XX}x (${RETRY_DELAY}ms delay)`);
-console.log(`Cache: ${MAX_CACHE_SIZE} entries max, ${CACHE_TTL / 1000}s TTL`);
+// Debug server for cache stats
+Bun.serve({
+  port: DEBUG_PORT,
+  async fetch(req) {
+    const url = new URL(req.url);
+    
+    if (url.pathname === "/") {
+      const now = Date.now();
+      const entries = [...responseCache.entries()].map(([key, entry]) => ({
+        key: key.slice(0, 8) + "...",
+        age: Math.round((now - entry.timestamp) / 1000) + "s",
+        status: entry.response.status,
+      }));
+      
+      return Response.json({
+        cache: {
+          size: responseCache.size,
+          maxSize: MAX_CACHE_SIZE,
+          ttl: CACHE_TTL / 1000 + "s",
+        },
+        config: {
+          retries_429: MAX_RETRIES_429,
+          retries_5xx: MAX_RETRIES_5XX,
+          retry_delay: RETRY_DELAY + "ms",
+        },
+        entries: entries.slice(0, 10), // Show first 10
+      });
+    }
+    
+    if (url.pathname === "/clear") {
+      responseCache.clear();
+      await saveCache();
+      return Response.json({ cleared: true });
+    }
+    
+    return new Response("Not found", { status: 404 });
+  },
+});
+
+// Initialize
+(async () => {
+  await loadCache();
+  log(`Retry proxy running on port ${PORT} -> ${UPSTREAM}`);
+  log(`Debug endpoint on port ${DEBUG_PORT}`);
+  log(`Retries: 429 → ${MAX_RETRIES_429}x, 5xx/connection → ${MAX_RETRIES_5XX}x (${RETRY_DELAY}ms delay)`);
+  log(`Cache: ${MAX_CACHE_SIZE} entries max, ${CACHE_TTL / 1000}s TTL, persisted to ${CACHE_FILE}`);
+})();

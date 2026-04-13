@@ -299,73 +299,68 @@ bun proxy.ts enable
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │ --> │ Retry Server │ --> │ Qwen Proxy  │ --> │  Qwen API   │
-│ (OpenAI SDK)│     │   (:8081)    │     │   (:8080)   │     │ (portal.ai) │
-└─────────────┘     └──────────────┘     └─────────────┘     └─────────────┘
-                           │
-                           │ retry 429s with exponential backoff
-                           v
-                    ┌─────────────┐
-                    │ Cloudflare  │
-                    │   Tunnel    │
-                    └─────────────┘
+Internet → Cloudflare Tunnel → localhost:8081 (retry-server) → localhost:8080 (qwen-proxy) → Qwen API
+
+                ↓                    ↓                          ↓
+         qwen.streamleapstudio.xyz  Port 8081              Port 8080
+         (permanent domain)    (retry + cache)         (qwen-proxy OAuth)
 ```
 
-### Retry Server
+### Files Created
 
-The retry server sits in front of qwen-proxy on port 8081 and handles:
+**`/root/.cloudflared/config.yml`** — Cloudflared tunnel config
+- `protocol: http2` — uses TCP/HTTP2 instead of QUIC (prevents gVisor crashes)
+- `no-autocreate: true` — prevents accidental tunnel creation
+- Routes `qwen.YOURDOMAIN.xyz` → `localhost:8081`
 
-**Retries on:**
-- `429` - Rate limited (up to 15 retries)
-- `502/503/504` - Upstream errors (up to 5 retries)
-- Connection failures - Network errors, timeouts, ECONNREFUSED (up to 5 retries)
+**`/usr/local/bin/qwen-proxy-startup.sh`** — Startup wrapper script
+- Starts cloudflared, retry-server, and qwen-proxy in correct order with delays
+- Monitors all three processes every 15 seconds
+- If any process dies → immediately restarts it and logs to `/dev/shm/`
+- This is what runs as the Zo service (mode: process)
 
-**Retry logic:**
-```typescript
-// Fixed 2s delay, up to 5 retries
-RETRY_STATUSES = [429, 502, 503, 504];
+**`/usr/local/bin/qwen-proxy-retry-server.ts`** — Bun/TypeScript retry proxy
+- Listens on port 8081, forwards to port 8080 (qwen-proxy)
+- Retries on 429/502/503/504/530 with 60 retries × 2s delay = 2 minute max wait
+- Caches POST `/v1/chat/completions` responses for 5 minutes
+- Logs all operations to `/dev/shm/retry-server.log`
+- Debug endpoint on port 8082: `GET /` returns cache stats
 
-// Also catches fetch() exceptions (network errors)
-catch (err) {
-  // Retry on connection failure
-}
+### Key Design Decisions
+
+| Decision | Why |
+|----------|-----|
+| HTTP/2 instead of QUIC | QUIC needs raw UDP sockets which crash in gVisor container |
+| All services in one wrapper | Only 1 process-mode service slot available |
+| 15s health check interval | Balance between quick recovery and not hammering the system |
+| File-based caching | In-memory Map lost on restart; file cache persists across restarts |
+| `PORT=8080` for qwen-proxy | Explicit port override since qwen-proxy defaults to env PORT |
+
+### Debugging
+
+```bash
+# Check all processes
+pgrep -fa 'cloudflared|qwen-proxy|qwen-proxy-retry'
+
+# Check logs
+cat /dev/shm/cloudflared.log | tail
+cat /dev/shm/retry-server.log | tail
+cat /dev/shm/qwen-proxy.log | tail
+
+# Check cache stats
+curl http://localhost:8082/
+
+# Clear cache
+curl http://localhost:8082/clear
+
+# Test the tunnel
+curl https://qwen.YOURDOMAIN.xyz/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"qwen3-coder-flash","messages":[{"role":"user","content":"Hi"}]}'
+
+# Check usage
+qwen-proxy usage
 ```
-
-**Architecture:**
-```
-cloudflared → :8081 (retry server) → :8080 (qwen-proxy) → Qwen API
-```
-
-When the tunnel drops and Cloudflare returns a 502 error page, the retry server catches it and keeps retrying until the tunnel recovers or qwen-proxy comes back online.
-
-### Response Caching
-
-The retry server also caches successful responses to avoid redundant API calls:
-
-```
-Request → Generate hash key from body → Check cache map
-                                         ↓
-                                   HIT? → Return cached response immediately
-                                         ↓ no
-                                   MISS? → Fetch from upstream qwen-proxy (with retry)
-                                         ↓
-                                   Cache response if OK (status 200)
-                                         ↓
-                                   Return to client
-```
-
-**Cache settings:**
-
-| Aspect | How it works |
-|--------|-------------|
-| **Cache key** | SHA-256 hash of the raw request body — identical prompts = same key |
-| **TTL** | 5 minutes per entry — after that, treated as fresh |
-| **Scope** | Only caches successful responses (status 200) |
-| **Eviction** | If > 100 entries, deletes oldest ones on next cache write |
-| **What's cached** | Full HTTP response — body + headers + status code |
-
-**Intended for:** Repeating the same system prompt or identical user messages hits cache instead of hitting Qwen's API again, avoiding 429s and saving tokens.
 
 ---
 

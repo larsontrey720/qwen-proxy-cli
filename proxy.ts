@@ -359,51 +359,121 @@ EOFCONFIG`);
   log("green", `✓ Updated cloudflared config to use retry server (port 8081)`);
   log("green", `✓ Added no-autocreate: true for safety`);
 
-  // Create startup script with retry server
+  // Create startup script with monitoring
   const startupScript = `#!/bin/bash
 # Qwen Proxy Startup Script with Retry Server
-# Starts both retry server (8081) and qwen-proxy (8080)
+# Starts and monitors all three services: cloudflared, qwen-proxy, retry-server
 #
-# Flow: cloudflared → :8081 (retry) → :8080 (qwen-proxy) → Qwen API
+# Architecture:
+#   Internet → cloudflared → :8081 (retry) → :8080 (qwen-proxy) → Qwen API
 #
-# IMPORTANT: Zo service with local_port=8081 injects PORT=8081.
-# We explicitly override PORT=8080 for qwen-proxy to prevent port collision.
+# Flow:
+#   1. Start cloudflared (permanent tunnel)
+#   2. Wait 3 seconds for tunnel to establish
+#   3. Start qwen-proxy on explicit PORT=8080
+#   4. Wait for qwen-proxy to be healthy
+#   5. Start retry-server (this becomes the main process)
+#   6. Monitor all processes every 15 seconds, restart if any die
 
 set -e
 
 # Paths
 SCRIPT_DIR="/home/workspace/Skills/qwen-proxy-setup/scripts"
-RETRY_SCRIPT="$SCRIPT_DIR/retry-server.ts"
+RETRY_SCRIPT="\$SCRIPT_DIR/retry-server.ts"
 CLOUDFLARE_CONFIG="${CLOUDFLARED_CONFIG}"
 LOG_DIR="/dev/shm"
+CHECK_INTERVAL=15
 
-# Start cloudflared (background)
-if [ -f "$CLOUDFLARE_CONFIG" ]; then
-    echo "Starting cloudflared tunnel..."
-    cloudflared --config "$CLOUDFLARE_CONFIG" tunnel run > "$LOG_DIR/cloudflared.log" 2>&1 &
-    CLOUDFLARED_PID=$!
+# PIDs
+CLOUDFLARED_PID=""
+QWEN_PID=""
+
+# Logging
+log() {
+  echo "\$(date -Iseconds) \$1" | tee -a "\$LOG_DIR/qwen-proxy-startup.log"
+}
+
+# Check if a process is running
+is_running() {
+  kill -0 "\$1" 2>/dev/null
+}
+
+# Start cloudflared
+start_cloudflared() {
+  if [ -f "\$CLOUDFLARE_CONFIG" ]; then
+    log "Starting cloudflared tunnel..."
+    cloudflared --config "\$CLOUDFLARE_CONFIG" tunnel run > "\$LOG_DIR/cloudflared.log" 2>&1 &
+    CLOUDFLARED_PID=\$!
     sleep 3
-fi
+    log "cloudflared started (PID: \$CLOUDFLARED_PID)"
+  else
+    log "ERROR: No cloudflared config found at \$CLOUDFLARE_CONFIG"
+    exit 1
+  fi
+}
 
-# Start qwen-proxy (background)
-# EXPLICITLY set PORT=8080 to override any Zo-injected PORT=8081
-echo "Starting qwen-proxy on :8080..."
-PORT=8080 qwen-proxy serve --headless > "$LOG_DIR/qwen-proxy.log" 2>&1 &
-QWEN_PID=$!
-
-# Wait for qwen-proxy to be ready
-for i in {1..10}; do
+# Start qwen-proxy on explicit port 8080
+start_qwen_proxy() {
+  log "Starting qwen-proxy on :8080..."
+  # EXPLICITLY set PORT=8080 to override any Zo-injected PORT=8081
+  PORT=8080 qwen-proxy serve --headless > "\$LOG_DIR/qwen-proxy.log" 2>&1 &
+  QWEN_PID=\$!
+  
+  # Wait for qwen-proxy to be ready
+  for i in {1..10}; do
     if curl -s http://localhost:8080/health > /dev/null 2>&1; then
-        echo "qwen-proxy ready"
-        break
+      log "qwen-proxy ready (PID: \$QWEN_PID)"
+      return 0
     fi
     sleep 1
-done
+  done
+  
+  log "WARNING: qwen-proxy not responding after 10s, continuing anyway..."
+}
+
+# Monitor all processes
+monitor() {
+  log "Starting process monitor (checking every \${CHECK_INTERVAL}s)..."
+  
+  while true; do
+    sleep \$CHECK_INTERVAL
+    
+    # Check cloudflared
+    if [ -n "\$CLOUDFLARED_PID" ] && ! is_running "\$CLOUDFLARED_PID"; then
+      log "cloudflared died, restarting..."
+      start_cloudflared
+    fi
+    
+    # Check qwen-proxy
+    if [ -n "\$QWEN_PID" ] && ! is_running "\$QWEN_PID"; then
+      log "qwen-proxy died, restarting..."
+      start_qwen_proxy
+    fi
+  done &
+  
+  MONITOR_PID=\$!
+}
+
+# Cleanup on exit
+cleanup() {
+  log "Shutting down..."
+  [ -n "\$CLOUDFLARED_PID" ] && kill "\$CLOUDFLARED_PID" 2>/dev/null || true
+  [ -n "\$QWEN_PID" ] && kill "\$QWEN_PID" 2>/dev/null || true
+  [ -n "\$MONITOR_PID" ] && kill "\$MONITOR_PID" 2>/dev/null || true
+  exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# Main startup sequence
+log "=== Qwen Proxy Startup ==="
+start_cloudflared
+start_qwen_proxy
+monitor
 
 # Start retry server (foreground - this becomes the main process)
-# Retry server binds to :8081, proxies to :8080
-echo "Starting retry server on :8081..."
-exec bun "$RETRY_SCRIPT"
+log "Starting retry server on :8081..."
+exec bun "\$RETRY_SCRIPT"
 `;
 
   await run(`cat > ${STARTUP_SCRIPT} << 'EOFSCRIPT'
