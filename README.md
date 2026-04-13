@@ -166,10 +166,10 @@ cloudflared tunnel route dns qwen-proxy qwen.YOURDOMAIN.COM
 # Output: Added CNAME qwen.YOURDOMAIN.COM which will route to this tunnel
 
 # 4. Run the tunnel (in foreground for testing)
-cloudflared tunnel run --url http://localhost:8080 qwen-proxy
+cloudflared tunnel run --url http://localhost:8081 qwen-proxy
 
 # 5. For background/production use:
-nohup cloudflared tunnel run --url http://localhost:8080 qwen-proxy > /dev/shm/cloudflared-persistent.log 2>&1 &
+nohup cloudflared tunnel run --url http://localhost:8081 qwen-proxy > /dev/shm/cloudflared-persistent.log 2>&1 &
 ```
 
 ### Verify It Works
@@ -235,15 +235,27 @@ This creates the startup script at `/usr/local/bin/qwen-proxy-startup.sh`:
 
 ```bash
 #!/bin/bash
-# Start cloudflared tunnel in background
-cloudflared --config /root/.cloudflared/config.yml tunnel run &
+# Qwen Proxy Startup - manages cloudflared, retry-server, and qwen-proxy
+# All three run in one process group for Zo service (mode: process)
+
+set -e
+
+# Start cloudflared tunnel (background)
+cloudflared --config /root/.cloudflared/config.yml tunnel run > /dev/shm/cloudflared.log 2>&1 &
 CLOUDFLARED_PID=$!
 
-# Wait briefly for tunnel to establish
+# Wait for tunnel
 sleep 3
 
-# Start qwen-proxy (replaces this process)
-exec qwen-proxy serve --headless
+# Start qwen-proxy on port 8080 (explicitly set to override any injected PORT)
+PORT=8080 qwen-proxy serve --headless > /dev/shm/qwen-proxy.log 2>&1 &
+QWEN_PID=$!
+
+# Wait for qwen-proxy
+sleep 2
+
+# Start retry-server on port 8081 (foreground - becomes main process)
+exec bun /usr/local/bin/qwen-proxy-retry-server.ts
 ```
 
 ### Register as Zo Service
@@ -254,15 +266,13 @@ After running `enable`, register via UI or CLI:
 1. Go to Hosting > Services
 2. Click "Add Service"
 3. Set entrypoint to: `/usr/local/bin/qwen-proxy-startup.sh`
-4. Set protocol to: `http`
-5. Set port to: `8080`
+4. Set mode to: `process` (no public port - tunnel handles external access)
 
 **Via CLI:**
 ```bash
 zo service create qwen-proxy \
   --entrypoint /usr/local/bin/qwen-proxy-startup.sh \
-  --protocol http \
-  --port 8080
+  --mode process
 ```
 
 ### Disable
@@ -275,7 +285,7 @@ Removes the service and startup script.
 
 ### How Auto-Startup Works
 
-The startup script uses a clever process replacement pattern:
+The startup script manages three processes:
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -288,68 +298,72 @@ The startup script uses a clever process replacement pattern:
 │              /usr/local/bin/qwen-proxy-startup.sh                  │
 │                        (entrypoint)                                 │
 ├────────────────────────────────────────────────────────────────────┤
-│  1. Fork cloudflared into background                               │
-│     ├─ cloudflared tunnel run &                                    │
-│     └─ PID stored in $CLOUDFLARED_PID                              │
+│  1. Start cloudflared tunnel (background)                          │
+│     └─ cloudflared --config ... tunnel run &                        │
 │                                                                     │
 │  2. Wait 3 seconds for tunnel to establish                         │
 │     └─ sleep 3                                                      │
 │                                                                     │
-│  3. Replace shell with qwen-proxy                                  │
-│     └─ exec qwen-proxy serve --headless                            │
+│  3. Start qwen-proxy on port 8080 (background)                     │
+│     └─ PORT=8080 qwen-proxy serve --headless &                     │
+│                                                                     │
+│  4. Wait 2 seconds for qwen-proxy                                  │
+│     └─ sleep 2                                                      │
+│                                                                     │
+│  5. Replace shell with retry-server (foreground)                   │
+│     └─ exec bun retry-server.ts                                    │
 │                                                                     │
 └────────────────────────────────┬───────────────────────────────────┘
                                  │
-                    ┌────────────┴────────────┐
-                    ▼                         ▼
-        ┌───────────────────┐     ┌───────────────────┐
-        │   cloudflared     │     │   qwen-proxy      │
-        │   (background)    │     │   (foreground)    │
-        │                   │     │                   │
-        │  localhost:8080   │◄────│  serves API on    │
-        │       ▲           │     │  port 8080        │
-        │       │           │     │                   │
-        └───────┼───────────┘     └───────────────────┘
-                │
-                ▼
-        ┌───────────────────┐
-        │  Cloudflare       │
-        │  Edge Network     │
-        │                   │
-        │  qwen.domain.com  │
-        └───────────────────┘
+          ┌──────────────────────┼──────────────────────┐
+          ▼                      ▼                      ▼
+  ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+  │  cloudflared  │    │  qwen-proxy   │    │ retry-server  │
+  │  (background) │    │  (background) │    │ (foreground)  │
+  │               │    │               │    │               │
+  │  Tunnel to    │    │  Port 8080    │◄───│  Port 8081    │
+  │  Cloudflare   │    │  Qwen API     │    │  Retry+Cache  │
+  │               │    │               │    │               │
+  └───────┬───────┘    └───────────────┘    └───────────────┘
+          │
+          ▼
+  ┌───────────────┐
+  │  Cloudflare   │
+  │  Edge Network │
+  │               │
+  │ qwen.dom.com  │
+  └───────────────┘
 ```
 
-**Why `exec`?**
+**Why `exec` for retry-server?**
 
-The `exec` command replaces the current shell process with qwen-proxy. This means:
-
-- The service manager sees qwen-proxy as the main process
-- If qwen-proxy crashes, the service manager detects it and restarts
-- Signals (SIGTERM, SIGINT) go directly to qwen-proxy for graceful shutdown
-- No orphaned shell processes
+The `exec` replaces the shell with retry-server, making it the main process:
+- Service manager sees retry-server as the main PID
+- If retry-server crashes, service manager restarts everything
+- All three processes share the same process group
 
 **Process tree after startup:**
 
 ```
-systemd/service-manager
-└── qwen-proxy serve --headless (PID: main)
-    └── cloudflared tunnel run (PID: child, background)
+service-manager
+└── bun retry-server.ts (PID: main, port 8081)
+    ├── cloudflared tunnel run (background)
+    └── qwen-proxy serve (background, port 8080)
 ```
 
 **On shutdown:**
 
-1. Service manager sends SIGTERM to qwen-proxy (main process)
-2. qwen-proxy handles graceful shutdown
-3. cloudflared continues running briefly, then exits when connection closes
+1. Service manager sends SIGTERM to retry-server (main process)
+2. retry-server handles graceful shutdown
+3. Background processes (cloudflared, qwen-proxy) exit when process group terminates
 4. Service manager considers service stopped
 
 **On crash:**
 
-1. qwen-proxy crashes
+1. retry-server crashes
 2. Service manager detects main process died
 3. Service manager restarts the entrypoint script
-4. Script starts fresh cloudflared + qwen-proxy
+4. Script starts fresh cloudflared + qwen-proxy + retry-server
 
 ## Architecture
 
@@ -370,8 +384,7 @@ Internet → Cloudflare Tunnel → localhost:8081 (retry-server) → localhost:8
 
 **`/usr/local/bin/qwen-proxy-startup.sh`** — Startup wrapper script
 - Starts cloudflared, retry-server, and qwen-proxy in correct order with delays
-- Monitors all three processes every 15 seconds
-- If any process dies → immediately restarts it and logs to `/dev/shm/`
+- Uses `exec` to make retry-server the main process (service manager monitors it)
 - This is what runs as the Zo service (mode: process)
 
 **`/usr/local/bin/qwen-proxy-retry-server.ts`** — Bun/TypeScript retry proxy
@@ -387,9 +400,9 @@ Internet → Cloudflare Tunnel → localhost:8081 (retry-server) → localhost:8
 |----------|-----|
 | HTTP/2 instead of QUIC | QUIC needs raw UDP sockets which crash in gVisor container |
 | All services in one wrapper | Only 1 process-mode service slot available |
-| 15s health check interval | Balance between quick recovery and not hammering the system |
 | File-based caching | In-memory Map lost on restart; file cache persists across restarts |
 | `PORT=8080` for qwen-proxy | Explicit port override since qwen-proxy defaults to env PORT |
+| `exec` into retry-server | Makes it the main process so service manager monitors it |
 
 ### Debugging
 
